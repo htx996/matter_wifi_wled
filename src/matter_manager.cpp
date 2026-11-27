@@ -26,6 +26,7 @@
 #include <nvs.h>
 #include <nvs_flash.h>
 #include <esp_system.h>
+#include <platform/CHIPDeviceLayer.h>
 
 // ── Matter cluster IDs (from the Matter Application Cluster Specification) ──
 static constexpr uint32_t MATTER_CL_ON_OFF       = 0x0006;
@@ -57,7 +58,7 @@ static esp_matter::endpoint_t *mAggregator = nullptr; // Bridge aggregator endpo
 static bool mStarted     = false;   // true after esp_matter::start() succeeds
 static bool mNodeReady   = false;   // true after node+endpoints created in setup
 static bool mSuppressed  = false;   // true when no lights configured
-static bool reconfigPending = false;
+static volatile bool reconfigPending = false;
 
 // Per-endpoint tracking
 struct EndpointInfo {
@@ -139,6 +140,9 @@ struct PendingState {
   volatile uint8_t colorMode;
 };
 static PendingState pendingStates[MAX_LIGHTS] = {};
+static uint8_t commandMask[MAX_LIGHTS] = {};
+static bool reachable[MAX_LIGHTS] = {};
+static uint8_t bootLightCount = 0;
 
 // Syncing flag — suppresses re-entrant callbacks during WLED→Matter sync
 static bool mSyncing = false;
@@ -159,7 +163,7 @@ static volatile bool mFactoryResetPending = false;
 
 // ── Helpers: endpoint ID to light index ─────────────────────────────────────
 static int endpointIdToIndex(uint16_t endpointId) {
-  uint8_t count = configStore.getLightCount();
+  uint8_t count = bootLightCount;
   for (uint8_t i = 0; i < count; i++) {
     if (endpoints[i].endpointId == endpointId) return i;
   }
@@ -425,7 +429,7 @@ static esp_err_t _attrCb(esp_matter::attribute::callback_type_t type,
                           void *priv_data)
 {
   if (type != esp_matter::attribute::POST_UPDATE) return ESP_OK;
-  if (mSyncing) return ESP_OK;
+  if (mSyncing || reconfigPending) return ESP_OK;
 
   int idx = endpointIdToIndex(endpoint_id);
   if (idx < 0) return ESP_OK;
@@ -486,7 +490,7 @@ static void _eventCb(const ChipDeviceEvent *event, intptr_t arg)
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void applyPending() {
-  uint8_t count = configStore.getLightCount();
+  uint8_t count = bootLightCount;
 
   for (uint8_t i = 0; i < count; i++) {
     PendingState &p = pendingStates[i];
@@ -501,19 +505,17 @@ static void applyPending() {
     bool applyXY  = p.xyDirty;  p.xyDirty  = false;
     bool applyCT  = p.ctDirty;  p.ctDirty  = false;
 
-    if (applyOn || applyBri) {
-      bool on = p.on;
-      uint8_t level = p.bri;
-      if (on) {
-        lightStates[i].powerOn = true;
-        lightStates[i].brightness = (level > 0) ? level : 128;
-      } else {
-        lightStates[i].powerOn = false;
-        lightStates[i].brightness = 0;
-      }
+    if (applyOn) {
+      lightStates[i].powerOn = p.on;
+      commandMask[i] |= WLED_CMD_POWER;
+    }
+    if (applyBri && p.bri > 0) {
+      lightStates[i].brightness = p.bri > 254 ? 254 : p.bri;
+      commandMask[i] |= WLED_CMD_BRIGHTNESS;
     }
 
     if (applyCT && p.colorMode == MATTER_CM_TEMP) {
+      commandMask[i] |= WLED_CMD_COLOR;
       uint8_t r, g, b, w;
       mirekToRGB(p.ct, r, g, b);
       decomposeRGBW(i, r, g, b, w);
@@ -526,6 +528,7 @@ static void applyPending() {
       lightStates[i].colorX = static_cast<float>(zclX) / 65279.0f;
       lightStates[i].colorY = static_cast<float>(zclY) / 65279.0f;
     } else if (applyXY && p.colorMode == MATTER_CM_XY) {
+      commandMask[i] |= WLED_CMD_COLOR;
       uint8_t r, g, b, w;
       xyToRGB(p.colorX, p.colorY, r, g, b);
       decomposeRGBW(i, r, g, b, w);
@@ -536,6 +539,7 @@ static void applyPending() {
       lightStates[i].colorX = static_cast<float>(p.colorX) / 65279.0f;
       lightStates[i].colorY = static_cast<float>(p.colorY) / 65279.0f;
     } else if (applyHS && p.colorMode != MATTER_CM_TEMP) {
+      commandMask[i] |= WLED_CMD_COLOR;
       uint8_t r, g, b, w;
       hsvToRGB(p.hue, p.sat, r, g, b);
       decomposeRGBW(i, r, g, b, w);
@@ -555,63 +559,47 @@ static void applyPending() {
 // Push WLED state changes (from web UI or external) back to Matter
 // ─────────────────────────────────────────────────────────────────────────────
 
-static byte prevCol[MAX_LIGHTS][4] = {};
-static byte prevBri[MAX_LIGHTS] = {};
-static bool prevOn[MAX_LIGHTS] = {};
-
-static void syncToMatter() {
-  uint8_t count = configStore.getLightCount();
+// Only read-back observations are reported to Matter. The CHIP stack lock
+// serializes external attribute updates with controller callbacks.
+static void reportObserved(uint8_t i, const LightState& state) {
+  const LightState old = lightStates[i];
+  const bool colorChanged = old.red != state.red || old.green != state.green ||
+      old.blue != state.blue || old.white != state.white || !reachable[i];
+  lightStates[i] = state;
+  PendingState &p = pendingStates[i];
+  p.on = state.powerOn;
+  p.bri = state.brightness;
+  uint16_t zclX, zclY;
+  uint8_t h, s;
+  uint8_t r = static_cast<uint8_t>(min(255, int(state.red) + state.white));
+  uint8_t g = static_cast<uint8_t>(min(255, int(state.green) + state.white));
+  uint8_t b = static_cast<uint8_t>(min(255, int(state.blue) + state.white));
+  rgbToMatterHS(r, g, b, h, s);
+  rgbToXY(r, g, b, zclX, zclY);
+  p.hue = h; p.sat = s; p.colorX = zclX; p.colorY = zclY;
+  const uint16_t epId = endpoints[i].endpointId;
   mSyncing = true;
-
-  for (uint8_t i = 0; i < count; i++) {
-    bool curOn = lightStates[i].powerOn;
-    uint8_t curBri = lightStates[i].brightness;
-    uint8_t curR = lightStates[i].red;
-    uint8_t curG = lightStates[i].green;
-    uint8_t curB = lightStates[i].blue;
-
-    if (curOn == prevOn[i] && curBri == prevBri[i] &&
-        curR == prevCol[i][0] && curG == prevCol[i][1] &&
-        curB == prevCol[i][2])
-      continue;
-
-    prevOn[i] = curOn;
-    prevBri[i] = curBri;
-    prevCol[i][0] = curR;
-    prevCol[i][1] = curG;
-    prevCol[i][2] = curB;
-
-    uint16_t epId = endpoints[i].endpointId;
-    esp_matter_attr_val_t val;
-
-    // On/Off
-    val = esp_matter_bool(curOn);
-    esp_matter::attribute::update(epId, MATTER_CL_ON_OFF,
-                                  MATTER_AT_ON_OFF, &val);
-
-    // Level — only update when on.  The Matter Level Control cluster has a
-    // minimum value of 1; pushing 0 causes error 0x87 (CONSTRAINT_ERROR).
-    // When the light is off, the on_off attribute already reflects the state
-    // and current_level retains its last-known brightness (per Matter spec).
-    if (curOn && curBri > 0) {
-      val = esp_matter_nullable_uint8(curBri);
-      esp_matter::attribute::update(epId, MATTER_CL_LEVEL_CTRL,
-                                    MATTER_AT_CURRENT_LEVEL, &val);
-    }
-
-    // Color — convert RGB to Matter hue/saturation
-    uint8_t matterHue, matterSat;
-    rgbToMatterHS(curR, curG, curB, matterHue, matterSat);
-
-    val = esp_matter_nullable_uint8(matterHue);
-    esp_matter::attribute::update(epId, MATTER_CL_COLOR_CTRL,
-                                  MATTER_AT_CURRENT_HUE, &val);
-
-    val = esp_matter_nullable_uint8(matterSat);
-    esp_matter::attribute::update(epId, MATTER_CL_COLOR_CTRL,
-                                  MATTER_AT_CURRENT_SAT, &val);
+  esp_matter_attr_val_t val = esp_matter_bool(state.powerOn);
+  esp_matter::attribute::update(epId, MATTER_CL_ON_OFF, MATTER_AT_ON_OFF, &val);
+  if (state.brightness > 0) {
+    val = esp_matter_nullable_uint8(state.brightness);
+    esp_matter::attribute::update(epId, MATTER_CL_LEVEL_CTRL, MATTER_AT_CURRENT_LEVEL, &val);
   }
-
+  if (colorChanged) {
+    // WLED reports RGB, not an authoritative color temperature.
+    p.colorMode = MATTER_CM_HS;
+    val = esp_matter_nullable_uint8(h);
+    esp_matter::attribute::update(epId, MATTER_CL_COLOR_CTRL, MATTER_AT_CURRENT_HUE, &val);
+    val = esp_matter_nullable_uint8(s);
+    esp_matter::attribute::update(epId, MATTER_CL_COLOR_CTRL, MATTER_AT_CURRENT_SAT, &val);
+    val = esp_matter_uint16(zclX);
+    esp_matter::attribute::update(epId, MATTER_CL_COLOR_CTRL, MATTER_AT_CURRENT_X, &val);
+    val = esp_matter_uint16(zclY);
+    esp_matter::attribute::update(epId, MATTER_CL_COLOR_CTRL, MATTER_AT_CURRENT_Y, &val);
+    val = esp_matter_enum8(MATTER_CM_HS);
+    esp_matter::attribute::update(epId, MATTER_CL_COLOR_CTRL, MATTER_AT_COLOR_MODE, &val);
+    esp_matter::attribute::update(epId, MATTER_CL_COLOR_CTRL, 0x4001, &val);
+  }
   mSyncing = false;
 }
 
@@ -748,10 +736,11 @@ void matterSetup() {
     }
   }
 
-  // Initialize default light states
+  bootLightCount = count;
+  // Local placeholders only; never sent to WLED before a successful read.
   for (uint8_t i = 0; i < count; i++) {
-    lightStates[i].powerOn = true;
-    lightStates[i].brightness = 254;
+    lightStates[i].powerOn = false;
+    lightStates[i].brightness = 128;
     uint8_t r = 255, g = 255, b = 255, w;
     decomposeRGBW(i, r, g, b, w);
     lightStates[i].red = r;
@@ -802,7 +791,7 @@ void matterSetup() {
 
     // 2a. Create or resume the bridged_node endpoint
     esp_matter::endpoint::bridged_node::config_t bridgedCfg;
-    bridgedCfg.bridged_device_basic_information.reachable = true;
+    bridgedCfg.bridged_device_basic_information.reachable = false;
 
     esp_matter::endpoint_t *ep = nullptr;
     uint16_t savedEpId = epMapLoad(cfg.mac);
@@ -852,8 +841,8 @@ void matterSetup() {
 
     // 2c. Composite the Extended Color Light device type onto the bridged node
     esp_matter::endpoint::extended_color_light::config_t lightCfg;
-    lightCfg.on_off.on_off                     = true;
-    lightCfg.level_control.current_level       = 254;
+    lightCfg.on_off.on_off                     = false;
+    lightCfg.level_control.current_level       = 128;
     lightCfg.color_control.color_mode          = MATTER_CM_HS;
     lightCfg.color_control.enhanced_color_mode = MATTER_CM_HS;
     lightCfg.color_control.hue_saturation.current_hue        = 0;
@@ -956,8 +945,10 @@ void matterLoop() {
     doMatterFactoryReset();  // does not return — calls esp_restart()
   }
 
+  if (reconfigPending) return;
+  chip::DeviceLayer::PlatformMgr().LockChipStack();
   applyPending();
-  syncToMatter();
+  chip::DeviceLayer::PlatformMgr().UnlockChipStack();
 }
 
 bool matterIsStarted() {
@@ -978,9 +969,29 @@ const LightState& matterGetLightState(uint8_t index) {
 }
 
 void matterReportState(uint8_t index, const LightState& state) {
-  if (index >= MAX_LIGHTS) return;
-  lightStates[index] = state;
-  // syncToMatter() in the next loop iteration will push to Matter
+  if (!mStarted || reconfigPending || index >= bootLightCount || !endpoints[index].endpointId) return;
+  chip::DeviceLayer::PlatformMgr().LockChipStack();
+  PendingState &p = pendingStates[index];
+  if (!p.onDirty && !p.briDirty && !p.hsDirty && !p.xyDirty && !p.ctDirty && !commandMask[index])
+    reportObserved(index, state);
+  chip::DeviceLayer::PlatformMgr().UnlockChipStack();
+}
+
+uint8_t matterTakeCommands(uint8_t index) {
+  if (!mStarted || reconfigPending || index >= bootLightCount) return 0;
+  uint8_t mask = commandMask[index];
+  commandMask[index] = 0;
+  return mask;
+}
+
+void matterReportReachable(uint8_t index, bool online) {
+  if (!mStarted || reconfigPending || index >= bootLightCount || !endpoints[index].endpointId) return;
+  if (reachable[index] == online) return;
+  chip::DeviceLayer::PlatformMgr().LockChipStack();
+  auto val = esp_matter_bool(online);
+  if (esp_matter::attribute::update(endpoints[index].endpointId, MATTER_CL_BDBI, 0x0011, &val) == ESP_OK)
+    reachable[index] = online;
+  chip::DeviceLayer::PlatformMgr().UnlockChipStack();
 }
 
 void matterReconfigure() {
