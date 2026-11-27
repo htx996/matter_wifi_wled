@@ -28,7 +28,7 @@
 #include "log_buffer.h"
 
 // WLED update rate: 2Hz
-static const unsigned long WLED_UPDATE_INTERVAL_MS = 500;
+static const unsigned long WLED_UPDATE_INTERVAL_MS = 50;
 static unsigned long lastWledUpdate = 0;
 
 void setup() {
@@ -45,6 +45,7 @@ void setup() {
 
   // 2. Init Matter node and endpoints (must be before WiFi for some SDK paths)
   matterSetup();
+  wledOutput.begin(); // freeze boot endpoint-to-WLED mapping before web changes
 
   // 3. Start WiFi + Web UI (this also triggers matterStart() on WiFi connect)
   webSetup();
@@ -62,12 +63,11 @@ void setup() {
     ESP_LOGI("OTA", "OTA update complete, rebooting...");
   });
   ArduinoOTA.onError([](ota_error_t error) {
-    ESP_LOGE("OTA", "OTA error: %u", error);
+    ESP_LOGE("OTA", "OTA error: %u; restart required to resume WLED control", error);
   });
   ArduinoOTA.begin();
 
-  // 4. Init WLED output
-  wledOutput.begin();
+
 }
 
 // Interpolate a single channel value for smooth transitions
