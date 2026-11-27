@@ -27,7 +27,9 @@
 #include <esp_http_server.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#ifndef WLED_USB_ONLY
 #include <Update.h>
+#endif
 #include <esp_netif.h>
 
 static httpd_handle_t httpServer = nullptr;
@@ -170,7 +172,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 </head>
 <body>
 <h1>Matter WLED Bridge</h1>
-<h2>ESP32-S3 Matter-to-WLED Light Controller</h2>
+<h2>ESP32 Matter-to-WLED Light Controller</h2>
 
 <div class="status" id="statusBar">
   <div class="status-item">
@@ -231,6 +233,9 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <button class="btn btn-danger btn-sm" onclick="factoryReset()">Factory Reset</button>
 </div>
 
+)rawliteral"
+#ifndef WLED_USB_ONLY
+R"rawliteral(
 <!-- OTA Firmware Update -->
 <div class="card" style="margin-top:12px">
   <h3 style="color:#00d4ff;margin-bottom:12px">Firmware Update</h3>
@@ -249,6 +254,11 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
   </form>
 </div>
 
+)rawliteral"
+#else
+R"rawliteral(<div class="card">USB-only firmware: OTA unavailable on the 4MB target.</div>)rawliteral"
+#endif
+R"rawliteral(
 <!-- Device Logs -->
 <div class="card" style="margin-top:12px">
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
@@ -1112,6 +1122,10 @@ static esp_err_t handleLogsClear(httpd_req_t *req) {
 
 // POST /api/ota — multipart firmware upload
 static esp_err_t handleOta(httpd_req_t *req) {
+#ifdef WLED_USB_ONLY
+  httpd_resp_set_status(req, "501 Not Implemented");
+  return httpd_resp_send(req, "USB-only firmware: OTA disabled", HTTPD_RESP_USE_STRLEN);
+#else
   int contentLen = req->content_len;
   if (contentLen <= 0) {
     httpd_resp_set_status(req, "400 Bad Request");
@@ -1263,6 +1277,7 @@ static esp_err_t handleOta(httpd_req_t *req) {
   }
 
   return ESP_OK;
+#endif
 }
 
 // ── SSE (Server-Sent Events) — async push from webLoop() ───────────────────

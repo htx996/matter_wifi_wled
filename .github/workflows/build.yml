@@ -26,6 +26,8 @@ jobs:
             flash: 8MB
           - env: esp32s3_16mb
             flash: 16MB
+          - env: esp32c3_4mb
+            flash: 4MB
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -55,6 +57,33 @@ jobs:
           if [ -f ".pio/build/$env_name/boot_app0.bin" ]; then
             cp ".pio/build/$env_name/boot_app0.bin" release/
           fi
+          python - "$env_name" <<'PY'
+          import sys
+          from pathlib import Path
+          import struct
+          target = sys.argv[1]
+          release = Path("release")
+          flash_code, chip_id, app_limit = {"esp32s3": (3, 9, 0x300000), "esp32s3_16mb": (4, 9, 0x300000), "esp32c3_4mb": (2, 5, 0x360000)}[target]
+          boot, part, app = [(release / f"{name}.bin").read_bytes() for name in ("bootloader", "partitions", "firmware")]
+          for data in (boot, app):
+              assert data[0] == 0xe9 and data[3] >> 4 == flash_code
+              assert struct.unpack_from("<H", data, 12)[0] == chip_id
+          assert len(boot) <= 0x8000 and len(part) <= 0x1000 and len(app) <= app_limit
+          segments = [(0, boot), (0x8000, part), (0x10000, app)]
+          if target != "esp32c3_4mb" and (release / "boot_app0.bin").exists():
+              segments.insert(2, (0xe000, (release / "boot_app0.bin").read_bytes()))
+          elif target == "esp32c3_4mb":
+              (release / "boot_app0.bin").unlink(missing_ok=True)
+          image = bytearray()
+          for offset, data in segments:
+              assert len(image) <= offset
+              image.extend(b"\xff" * (offset-len(image)))
+              image.extend(data)
+          for offset, data in segments:
+              assert image[offset:offset+len(data)] == data
+          (release / f"{target}-merged.bin").write_bytes(image)
+          print(f"{target}: merged {len(image)} bytes at 0x0")
+          PY
           git rev-parse HEAD > release/build-commit.txt
           printf '%s\n' "$env_name" > release/build-target.txt
           (cd release && sha256sum *.bin > SHA256SUMS)

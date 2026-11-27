@@ -20,7 +20,9 @@
  */
 
 #include <Arduino.h>
+#ifndef WLED_USB_ONLY
 #include <ArduinoOTA.h>
+#endif
 #include "config_store.h"
 #include "wled_output.h"
 #include "web_ui.h"
@@ -53,6 +55,7 @@ void setup() {
   // 3b. Setup ArduinoOTA for network-based firmware upload from PlatformIO
   //     Disable ArduinoOTA's built-in mDNS — it conflicts with CHIP's minimal
   //     mDNS (both try to bind UDP port 5353).  OTA still works by IP address.
+#ifndef WLED_USB_ONLY
   ArduinoOTA.setHostname("matterwled");
   ArduinoOTA.setMdnsEnabled(false);
   ArduinoOTA.onStart([]() {
@@ -66,6 +69,7 @@ void setup() {
     ESP_LOGE("OTA", "OTA error: %u; restart required to resume WLED control", error);
   });
   ArduinoOTA.begin();
+#endif
 
 
 }
@@ -80,7 +84,9 @@ void loop() {
   webLoop();
 
   // Handle OTA updates
+#ifndef WLED_USB_ONLY
   ArduinoOTA.handle();
+#endif
 
   // Process Matter state changes
   matterLoop();
@@ -122,4 +128,8 @@ void loop() {
       wledOutput.update(&configStore.getLight(0), states, count);
     }
   }
+#if CONFIG_FREERTOS_UNICORE
+  // Give the idle task time to run on single-core targets.
+  delay(1);
+#endif
 }
