@@ -30,8 +30,20 @@ CONFIG_MBEDTLS_HKDF_C=y
 # (8MB for default targets, 16MB for N16R8 variant)
 
 # Arduino is an ESP-IDF component in this dual-framework build, so lib_ignore
-# alone cannot exclude its built-in Matter C++ wrapper. Keep all other
-# Arduino libraries at their SDK defaults and disable ONLY that wrapper.
-# The application's managed espressif/esp_matter dependency remains enabled.
+# alone cannot exclude its built-in Matter C++ wrapper. Selectively disable
+# unused high-level wrappers; the managed esp_matter SDK remains enabled.
 CONFIG_ARDUINO_SELECTIVE_COMPILATION=y
 # CONFIG_ARDUINO_SELECTIVE_Matter is not set
+
+# This bridge has no voice recognition, audio, RainMaker, Zigbee, BLE or
+# Arduino Thread/provisioning feature. Keep WiFi, Network, DNS, Preferences,
+# Update, ArduinoOTA, Hash and ESPmDNS enabled (SDK defaults).
+# CONFIG_ARDUINO_SELECTIVE_ESP_SR is not set
+# CONFIG_ARDUINO_SELECTIVE_RainMaker is not set
+# CONFIG_ARDUINO_SELECTIVE_Insights is not set
+# CONFIG_ARDUINO_SELECTIVE_Zigbee is not set
+# CONFIG_ARDUINO_SELECTIVE_BLE is not set
+# CONFIG_ARDUINO_SELECTIVE_BluetoothSerial is not set
+# CONFIG_ARDUINO_SELECTIVE_SimpleBLE is not set
+# CONFIG_ARDUINO_SELECTIVE_OpenThread is not set
+# CONFIG_ARDUINO_SELECTIVE_WiFiProv is not set
