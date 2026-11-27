@@ -848,8 +848,7 @@ void matterSetup() {
     lightCfg.level_control.current_level       = 128;
     lightCfg.color_control.color_mode          = MATTER_CM_HS;
     lightCfg.color_control.enhanced_color_mode = MATTER_CM_HS;
-    lightCfg.color_control.hue_saturation.current_hue        = 0;
-    lightCfg.color_control.hue_saturation.current_saturation = 0;
+    // HS is initialized separately through feature::hue_saturation::add below.
 
     esp_err_t err = esp_matter::endpoint::extended_color_light::add(ep, &lightCfg);
     if (err != ESP_OK) {
