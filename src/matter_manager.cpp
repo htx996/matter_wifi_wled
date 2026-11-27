@@ -576,12 +576,15 @@ static void reportObserved(uint8_t i, const LightState& state) {
   uint8_t b = static_cast<uint8_t>(min(255, int(state.blue) + state.white));
   rgbToMatterHS(r, g, b, h, s);
   rgbToXY(r, g, b, zclX, zclY);
-  p.hue = h; p.sat = s; p.colorX = zclX; p.colorY = zclY;
+  if (colorChanged) { p.hue = h; p.sat = s; p.colorX = zclX; p.colorY = zclY; }
+  lightStates[i].colorX = static_cast<float>(zclX) / 65279.0f;
+  lightStates[i].colorY = static_cast<float>(zclY) / 65279.0f;
   const uint16_t epId = endpoints[i].endpointId;
   mSyncing = true;
   esp_matter_attr_val_t val = esp_matter_bool(state.powerOn);
-  esp_matter::attribute::update(epId, MATTER_CL_ON_OFF, MATTER_AT_ON_OFF, &val);
-  if (state.brightness > 0) {
+  if (!reachable[i] || old.powerOn != state.powerOn)
+    esp_matter::attribute::update(epId, MATTER_CL_ON_OFF, MATTER_AT_ON_OFF, &val);
+  if (state.brightness > 0 && (!reachable[i] || old.brightness != state.brightness)) {
     val = esp_matter_nullable_uint8(state.brightness);
     esp_matter::attribute::update(epId, MATTER_CL_LEVEL_CTRL, MATTER_AT_CURRENT_LEVEL, &val);
   }
