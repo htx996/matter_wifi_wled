@@ -105,11 +105,14 @@ bool readState(const LightConfig& cfg, LightState& state, uint8_t& segment) {
   return true;
 }
 
-bool writeCommand(const Job& job, uint8_t segment) {
+bool writeCommand(const Job& job, uint8_t segment, bool actualOn) {
   JsonDocument doc;
   if (job.mask & WLED_CMD_POWER) doc["on"] = job.desired.powerOn;
-  if (job.mask & WLED_CMD_BRIGHTNESS)
+  if (job.mask & WLED_CMD_BRIGHTNESS) {
+    // WLED treats nonzero bri alone as on. Preserve power for level-only changes.
     doc["bri"] = job.desired.brightness >= 254 ? 255 : max(1, int(job.desired.brightness));
+    if (!(job.mask & WLED_CMD_POWER)) doc["on"] = actualOn;
+  }
   if (job.mask & WLED_CMD_COLOR) {
     JsonObject seg = doc["seg"].to<JsonArray>().add<JsonObject>();
     seg["id"] = segment;
@@ -133,7 +136,7 @@ void worker(void*) {
     // Read before every command, including recovery after an outage.
     result.ok = readState(job.cfg, result.actual, result.segment);
     if (result.ok && job.mask) {
-      const bool sent = wledOutput.isRunning() && writeCommand(job, result.segment);
+      const bool sent = wledOutput.isRunning() && writeCommand(job, result.segment, result.actual.powerOn);
       // Never replay a failed/stale command automatically.
       result.ok = sent && readState(job.cfg, result.actual, result.segment);
     }
