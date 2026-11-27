@@ -56,3 +56,10 @@ uint16_t matterGetEndpointId(uint8_t index);
 
 // Perform a Matter-only factory reset (preserves WiFi credentials)
 void matterFactoryReset();
+
+// Explicit controller changes only: read-back must never generate a write.
+static constexpr uint8_t WLED_CMD_POWER = 1;
+static constexpr uint8_t WLED_CMD_BRIGHTNESS = 2;
+static constexpr uint8_t WLED_CMD_COLOR = 4;
+uint8_t matterTakeCommands(uint8_t index);
+void matterReportReachable(uint8_t index, bool online);
