@@ -1004,10 +1004,15 @@ static esp_err_t handleConfigPost(httpd_req_t *req) {
     return sendJson(req, resp);
   }
 
+  // Freeze the running endpoint mapping before changing the stored light list.
+  // The existing bridge requires a restart for endpoint topology changes.
+  if (doc["lights"].is<JsonArray>()) {
+    wledOutput.stop();
+    matterReconfigure();
+  }
   if (configStore.fromJson(doc)) {
     configStore.save();
     ESP_LOGI("Web", "Config saved: %d lights", configStore.getLightCount());
-    matterReconfigure();
     return sendJson(req, "{\"ok\":true}");
   } else {
     ESP_LOGE("Web", "fromJson failed");
